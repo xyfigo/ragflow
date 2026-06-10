@@ -21,6 +21,8 @@ import time
 import uuid
 from copy import deepcopy
 
+from peewee import IntegrityError
+
 from api.db import UserTenantRole
 from api.db.db_models import init_database_tables as init_web_db, LLMFactories, LLM, TenantLLM
 from api.db.services import UserService
@@ -31,7 +33,9 @@ from api.db.services.tenant_llm_service import LLMFactoriesService, TenantLLMSer
 from api.db.services.llm_service import LLMService, LLMBundle, get_init_tenant_llm
 from api.db.services.user_service import TenantService, UserTenantService
 from api.db.services.system_settings_service import SystemSettingsService
+from api.db.template_utils import normalize_canvas_template_categories
 from api.db.joint_services.memory_message_service import init_message_id_sequence, init_memory_size_cache, fix_missing_tokenized_memory
+from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
 from common.constants import LLMType
 from common.file_utils import get_project_base_directory
 from common import settings
@@ -42,6 +46,10 @@ DEFAULT_SUPERUSER_EMAIL = os.getenv("DEFAULT_SUPERUSER_EMAIL", "admin@ragflow.io
 DEFAULT_SUPERUSER_PASSWORD = os.getenv("DEFAULT_SUPERUSER_PASSWORD", "admin")
 
 def init_superuser(nickname=DEFAULT_SUPERUSER_NICKNAME, email=DEFAULT_SUPERUSER_EMAIL, password=DEFAULT_SUPERUSER_PASSWORD, role=UserTenantRole.OWNER):
+    if UserService.query(email=email):
+        logging.info("User with email %s already exists, skipping initialization.", email)
+        return
+
     user_info = {
         "id": uuid.uuid1().hex,
         "password": encode_to_base64(password),
@@ -58,7 +66,8 @@ def init_superuser(nickname=DEFAULT_SUPERUSER_NICKNAME, email=DEFAULT_SUPERUSER_
         "embd_id": settings.EMBEDDING_MDL,
         "asr_id": settings.ASR_MDL,
         "parser_ids": settings.PARSERS,
-        "img2txt_id": settings.IMAGE2TEXT_MDL
+        "img2txt_id": settings.IMAGE2TEXT_MDL,
+        "rerank_id": settings.RERANK_MDL,
     }
     usr_tenant = {
         "tenant_id": user_info["id"],
@@ -69,8 +78,12 @@ def init_superuser(nickname=DEFAULT_SUPERUSER_NICKNAME, email=DEFAULT_SUPERUSER_
 
     tenant_llm = get_init_tenant_llm(user_info["id"])
 
-    if not UserService.save(**user_info):
-        logging.error("can't init admin.")
+    try:
+        if not UserService.save(**user_info):
+            logging.error("can't init admin.")
+            return
+    except IntegrityError:
+        logging.info("User with email %s already exists, skipping.", email)
         return
     TenantService.insert(**tenant)
     UserTenantService.insert(**usr_tenant)
@@ -78,22 +91,23 @@ def init_superuser(nickname=DEFAULT_SUPERUSER_NICKNAME, email=DEFAULT_SUPERUSER_
     logging.info(
         f"Super user initialized. email: {email},A default password has been set; changing the password after login is strongly recommended.")
 
-    chat_mdl = LLMBundle(tenant["id"], LLMType.CHAT, tenant["llm_id"])
-    msg = asyncio.run(chat_mdl.async_chat(system="", history=[{"role": "user", "content": "Hello!"}], gen_conf={}))
-    if msg.find("ERROR: ") == 0:
-        logging.error(
-            "'{}' doesn't work. {}".format(
-                tenant["llm_id"],
-                msg))
-    embd_mdl = LLMBundle(tenant["id"], LLMType.EMBEDDING, tenant["embd_id"])
-    v, c = embd_mdl.encode(["Hello!"])
-    if c == 0:
-        logging.error(
-            "'{}' doesn't work!".format(
-                tenant["embd_id"]))
+    if tenant["llm_id"]:
+        chat_model_config = get_tenant_default_model_by_type(tenant["id"], LLMType.CHAT)
+        chat_mdl = LLMBundle(tenant["id"], chat_model_config)
+        msg = asyncio.run(chat_mdl.async_chat(system="", history=[{"role": "user", "content": "Hello!"}], gen_conf={}))
+        if msg.find("ERROR: ") == 0:
+            logging.error("'{}' doesn't work. {}".format( tenant["llm_id"], msg))
+
+    if tenant["embd_id"]:
+        embd_model_config = get_tenant_default_model_by_type(tenant["id"], LLMType.EMBEDDING)
+        embd_mdl = LLMBundle(tenant["id"], embd_model_config)
+        v, c = embd_mdl.encode(["Hello!"])
+        if c == 0:
+            logging.error("'{}' doesn't work!".format(tenant["embd_id"]))
 
 
 def init_llm_factory():
+    # todo deprecated
     LLMFactoriesService.filter_delete([1 == 1])
     factory_llm_infos = settings.FACTORY_LLM_INFOS
     for factory_llm_info in factory_llm_infos:
@@ -139,6 +153,8 @@ def init_llm_factory():
             except Exception:
                 pass
             break
+
+def update_document_number_in_init():
     doc_count = DocumentService.get_all_kb_doc_count()
     for kb_id in KnowledgebaseService.get_all_ids():
         KnowledgebaseService.update_document_number_in_init(kb_id=kb_id, doc_num=doc_count.get(kb_id, 0))
@@ -152,15 +168,21 @@ def add_graph_templates():
         logging.warning("Missing agent templates!")
         return
 
-    for fnm in os.listdir(dir):
+    for fnm in sorted(os.listdir(dir)):
+        if not fnm.endswith(".json"):
+            logging.debug("Skipping non-json template file in %s: %s", dir, fnm)
+            continue
+        template_path = os.path.join(dir, fnm)
         try:
-            cnvs = json.load(open(os.path.join(dir, fnm), "r",encoding="utf-8"))
+            with open(template_path, "r", encoding="utf-8") as f:
+                cnvs = normalize_canvas_template_categories(json.load(f))
+            logging.info("Loaded and normalized template file: %s", template_path)
             try:
                 CanvasTemplateService.save(**cnvs)
             except Exception:
                 CanvasTemplateService.update_by_id(cnvs["id"], cnvs)
         except Exception as e:
-            logging.exception(f"Add agent templates error: {e}")
+            logging.exception("Add agent templates error for %s: %s", template_path, e)
 
 
 def init_web_data():
@@ -168,7 +190,8 @@ def init_web_data():
 
     init_table()
 
-    init_llm_factory()
+    # init_llm_factory()
+    update_document_number_in_init()
     # if not UserService.get_all().count():
     #    init_superuser()
 
