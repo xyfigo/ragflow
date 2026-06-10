@@ -1,3 +1,8 @@
+export enum ModelStatus {
+  Active = 'active',
+  Inactive = 'inactive',
+}
+
 export enum LLMFactory {
   TongYiQianWen = 'Tongyi-Qianwen',
   Moonshot = 'Moonshot',
@@ -62,7 +67,11 @@ export enum LLMFactory {
   Builtin = 'Builtin',
   MinerU = 'MinerU',
   PaddleOCR = 'PaddleOCR',
+  OpenDataLoader = 'OpenDataLoader',
   N1n = 'n1n',
+  Avian = 'Avian',
+  RAGcon = 'RAGcon',
+  Perplexity = 'Perplexity',
 }
 
 // Please lowercase the file name
@@ -131,6 +140,27 @@ export const IconMap = {
   [LLMFactory.MinerU]: 'mineru',
   [LLMFactory.PaddleOCR]: 'paddleocr',
   [LLMFactory.N1n]: 'n1n',
+  [LLMFactory.Avian]: 'avian',
+  [LLMFactory.RAGcon]: 'ragcon',
+  [LLMFactory.Perplexity]: 'perplexity',
+};
+
+export const ModelTypeToField: Record<string, string> = {
+  chat: 'llm_id',
+  embedding: 'embd_id',
+  image2text: 'img2txt_id',
+  speech2text: 'asr_id',
+  rerank: 'rerank_id',
+  tts: 'tts_id',
+};
+
+export const FieldToModelType: Record<string, string> = {
+  llm_id: 'chat',
+  embd_id: 'embedding',
+  img2txt_id: 'vision',
+  asr_id: 'asr',
+  rerank_id: 'rerank',
+  tts_id: 'tts',
 };
 
 export const APIMapUrl = {
@@ -183,4 +213,7 @@ export const APIMapUrl = {
   [LLMFactory.DeepInfra]: 'https://deepinfra.com/dash/api_keys',
   [LLMFactory.PaddleOCR]: 'https://www.paddleocr.ai/latest/',
   [LLMFactory.N1n]: 'https://docs.n1n.ai',
+  [LLMFactory.Avian]: 'https://avian.io',
+  [LLMFactory.Perplexity]:
+    'https://docs.perplexity.ai/docs/embeddings/quickstart',
 };

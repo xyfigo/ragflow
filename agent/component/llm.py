@@ -24,7 +24,7 @@ import json_repair
 from functools import partial
 from common.constants import LLMType
 from api.db.services.llm_service import LLMBundle
-from api.db.services.tenant_llm_service import TenantLLMService
+from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance, get_model_type_by_name
 from agent.component.base import ComponentBase, ComponentParamBase
 from common.connection_utils import timeout
 from rag.prompts.generator import tool_call_summary, message_fit_in, citation_prompt, structured_output_prompt
@@ -84,10 +84,12 @@ class LLM(ComponentBase):
 
     def __init__(self, canvas, component_id, param: ComponentParamBase):
         super().__init__(canvas, component_id, param)
-        self.chat_mdl = LLMBundle(self._canvas.get_tenant_id(), TenantLLMService.llm_id2llm_type(self._param.llm_id),
-                                  self._param.llm_id, max_retries=self._param.max_retries,
-                                  retry_interval=self._param.delay_after_error
-                                  )
+        model_types = get_model_type_by_name(self._canvas.get_tenant_id(), self._param.llm_id)
+        model_type = "chat" if "chat" in model_types else model_types[0]
+        chat_model_config = get_model_config_from_provider_instance(self._canvas.get_tenant_id(), model_type, self._param.llm_id)
+        self.chat_mdl = LLMBundle(self._canvas.get_tenant_id(), chat_model_config,
+                                  max_retries=self._param.max_retries,
+                                  retry_interval=self._param.delay_after_error)
         self.imgs = []
 
     def get_input_form(self) -> dict[str, dict]:
@@ -125,29 +127,139 @@ class LLM(ComponentBase):
             msg.append(p)
         return msg, self.string_format(self._param.sys_prompt, args)
 
-    def _prepare_prompt_variables(self):
-        if self._param.visual_files_var:
-            self.imgs = self._canvas.get_variable_value(self._param.visual_files_var)
-            if not self.imgs:
-                self.imgs = []
-            self.imgs = [img for img in self.imgs if img[:len("data:image/")] == "data:image/"]
-            if self.imgs and TenantLLMService.llm_id2llm_type(self._param.llm_id) == LLMType.CHAT.value:
-                self.chat_mdl = LLMBundle(self._canvas.get_tenant_id(), LLMType.IMAGE2TEXT.value,
-                                          self._param.llm_id, max_retries=self._param.max_retries,
-                                          retry_interval=self._param.delay_after_error
-                                          )
+    @staticmethod
+    def _extract_data_images(value) -> list[str]:
+        imgs = []
 
+        def walk(v):
+            if v is None:
+                return
+            if isinstance(v, str):
+                v = v.strip()
+                if v.startswith("data:image/"):
+                    imgs.append(v)
+                return
+            if isinstance(v, (list, tuple, set)):
+                for item in v:
+                    walk(item)
+                return
+            if isinstance(v, dict):
+                if "content" in v:
+                    walk(v.get("content"))
+                else:
+                    for item in v.values():
+                        walk(item)
+
+        walk(value)
+        return imgs
+
+    @staticmethod
+    def _uniq_images(images: list[str]) -> list[str]:
+        seen = set()
+        uniq = []
+        for img in images:
+            if not isinstance(img, str):
+                continue
+            if not img.startswith("data:image/"):
+                continue
+            if img in seen:
+                continue
+            seen.add(img)
+            uniq.append(img)
+        return uniq
+
+    @classmethod
+    def _remove_data_images(cls, value):
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            return None if value.strip().startswith("data:image/") else value
+
+        if isinstance(value, list):
+            cleaned = []
+            for item in value:
+                v = cls._remove_data_images(item)
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple, set, dict)) and not v:
+                    continue
+                cleaned.append(v)
+            return cleaned
+
+        if isinstance(value, tuple):
+            cleaned = []
+            for item in value:
+                v = cls._remove_data_images(item)
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple, set, dict)) and not v:
+                    continue
+                cleaned.append(v)
+            return tuple(cleaned)
+
+        if isinstance(value, set):
+            cleaned = []
+            for item in value:
+                v = cls._remove_data_images(item)
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple, set, dict)) and not v:
+                    continue
+                cleaned.append(v)
+            return cleaned
+
+        if isinstance(value, dict):
+            if value.get("type") in {"image_url", "input_image", "image"} and cls._extract_data_images(value):
+                return None
+
+            cleaned = {}
+            for k, item in value.items():
+                v = cls._remove_data_images(item)
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple, set, dict)) and not v:
+                    continue
+                cleaned[k] = v
+            return cleaned
+
+        return value
+
+    def _prepare_prompt_variables(self):
+        self.imgs = []
+        if self._param.visual_files_var:
+            visual_val = self._canvas.get_variable_value(self._param.visual_files_var)
+            self.imgs.extend(self._extract_data_images(visual_val))
 
         args = {}
         vars = self.get_input_elements() if not self._param.debug_inputs else self._param.debug_inputs
+        extracted_imgs = []
         for k, o in vars.items():
-            args[k] = o["value"]
+            raw_value = o["value"]
+            extracted_imgs.extend(self._extract_data_images(raw_value))
+            args[k] = self._remove_data_images(raw_value)
+            if args[k] is None:
+                args[k] = ""
             if not isinstance(args[k], str):
                 try:
                     args[k] = json.dumps(args[k], ensure_ascii=False)
                 except Exception:
                     args[k] = str(args[k])
             self.set_input_value(k, args[k])
+
+        self.imgs = self._uniq_images(self.imgs + extracted_imgs)
+        model_types = get_model_type_by_name(self._canvas.get_tenant_id(), self._param.llm_id)
+        if self.imgs and LLMType.IMAGE2TEXT.value in model_types:
+            model_type = LLMType.IMAGE2TEXT.value
+        elif LLMType.CHAT.value in model_types:
+            model_type = LLMType.CHAT.value
+        else:
+            model_type = model_types[0]
+        model_config = get_model_config_from_provider_instance(self._canvas.get_tenant_id(), model_type, self._param.llm_id)
+        if self.imgs:
+            self.chat_mdl = LLMBundle(self._canvas.get_tenant_id(), model_config, max_retries=self._param.max_retries,
+                                      retry_interval=self._param.delay_after_error
+                                      )
 
         msg, sys_prompt = self._sys_prompt_and_msg(self._canvas.get_history(self._param.message_history_window_size)[:-1], args)
         user_defined_prompt, sys_prompt = self._extract_prompts(sys_prompt)
@@ -241,6 +353,8 @@ class LLM(ComponentBase):
             return re.sub(r"(<think>|</think>)", "", delta_ans)
 
         stream_kwargs = {"images": self.imgs} if self.imgs else {}
+        extra_chat_kwargs = self._get_chat_template_kwargs()
+        stream_kwargs.update(extra_chat_kwargs)
         async for ans in self.chat_mdl.async_chat_streamly(msg[0]["content"], msg[1:], self._param.gen_conf(), **stream_kwargs):
             if self.check_if_canceled("LLM streaming"):
                 return
@@ -271,6 +385,7 @@ class LLM(ComponentBase):
             return re.sub(r"```\n*$", "", ans, flags=re.DOTALL)
 
         prompt, msg, _ = self._prepare_prompt_variables()
+        extra_chat_kwargs = self._get_chat_template_kwargs()
         error: str = ""
         output_structure = None
         try:
@@ -289,7 +404,7 @@ class LLM(ComponentBase):
                     int(self.chat_mdl.max_length * 0.97),
                 )
                 error = ""
-                ans = await self._generate_async(msg_fit)
+                ans = await self._generate_async(msg_fit, **extra_chat_kwargs)
                 msg_fit.pop(0)
                 if ans.find("**ERROR**") >= 0:
                     logging.error(f"LLM response error: {ans}")
@@ -322,7 +437,7 @@ class LLM(ComponentBase):
                 [{"role": "system", "content": prompt}, *deepcopy(msg)], int(self.chat_mdl.max_length * 0.97)
             )
             error = ""
-            ans = await self._generate_async(msg_fit)
+            ans = await self._generate_async(msg_fit, **extra_chat_kwargs)
             msg_fit.pop(0)
             if ans.find("**ERROR**") >= 0:
                 logging.error(f"LLM response error: {ans}")
@@ -340,6 +455,24 @@ class LLM(ComponentBase):
     @timeout(int(os.environ.get("COMPONENT_EXEC_TIMEOUT", 10*60)))
     def _invoke(self, **kwargs):
         return asyncio.run(self._invoke_async(**kwargs))
+
+    def _get_chat_template_kwargs(self) -> dict[str, Any]:
+        chat_template_kwargs = self._canvas.globals.get("sys.chat_template_kwargs")
+        if chat_template_kwargs is None:
+            return {}
+
+        # The API should pass this as a JSON object, but accept a JSON string for compatibility.
+        if isinstance(chat_template_kwargs, str):
+            try:
+                chat_template_kwargs = json_repair.loads(chat_template_kwargs)
+            except Exception:
+                logging.warning("Ignore invalid sys.chat_template_kwargs: expected JSON object or JSON string object.")
+                return {}
+
+        if not isinstance(chat_template_kwargs, dict):
+            logging.warning("Ignore invalid sys.chat_template_kwargs type: %s", type(chat_template_kwargs).__name__)
+            return {}
+        return {"chat_template_kwargs": chat_template_kwargs}
 
     async def add_memory(self, user:str, assist:str, func_name: str, params: dict, results: str, user_defined_prompt:dict={}):
         summ = await tool_call_summary(self.chat_mdl, func_name, params, results, user_defined_prompt)
